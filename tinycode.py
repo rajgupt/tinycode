@@ -14,6 +14,7 @@ from rich.table import Table
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from deepagents import create_deep_agent
+from deepagents.backends.filesystem import FilesystemBackend
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -128,6 +129,7 @@ def build_agent(model: ChatOpenAI, system_prompt: str, checkpointer=None):
         model=model,
         system_prompt=system_prompt,
         checkpointer=checkpointer,
+        backend=FilesystemBackend(root_dir=Path.cwd(), virtual_mode=True),
     )
 
 # ---------------------------------------------------------------------------
