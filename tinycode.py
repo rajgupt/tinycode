@@ -38,14 +38,19 @@ You are a concise, expert coding assistant.
 
 def load_config() -> dict:
     try:
-        return json.loads(CONFIG_FILE.read_text())
-    except Exception:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        click.echo(f"warning: malformed config at {CONFIG_FILE}, ignoring", err=True)
         return {}
 
 
 def save_config(data: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(data, indent=2))
+    CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Restrict to owner — the file contains an API key.
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def get_api_key() -> str | None:
@@ -53,7 +58,17 @@ def get_api_key() -> str | None:
 
 
 def get_default_model() -> str:
-    return load_config().get("default_model", DEFAULT_MODEL)
+    return (
+        os.environ.get("TINYCODE_MODEL")
+        or load_config().get("default_model")
+        or DEFAULT_MODEL
+    )
+
+
+def mask_key(key: str) -> str:
+    if len(key) <= 12:
+        return "***"
+    return key[:8] + "..." + key[-4:]
 
 
 def require_api_key() -> str:
@@ -83,7 +98,11 @@ def build_user_content(prompt: str, files: tuple[str, ...], stdin_text: str | No
     if stdin_text:
         parts.append(f"<stdin>\n{stdin_text}\n</stdin>")
     for f in files:
-        parts.append(f'<file path="{f}">\n{Path(f).read_text()}\n</file>')
+        try:
+            content = Path(f).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise click.ClickException(f"could not read {f}: {e}")
+        parts.append(f'<file path="{f}">\n{content}\n</file>')
     parts.append(prompt)
     return "\n\n".join(parts)
 
@@ -96,6 +115,7 @@ def build_model(api_key: str, model_id: str) -> ChatOpenAI:
         model=model_id,
         api_key=api_key,
         base_url=OPENROUTER_BASE,
+        timeout=120,
         default_headers={
             "HTTP-Referer": "https://github.com/rajgupt/tinycode",
             "X-Title": "tinycode",
@@ -132,6 +152,11 @@ def stream_to_terminal(agent, messages: list[dict], config: dict | None = None) 
         raise click.ClickException("Rate limited — wait a moment and try again.")
     except openai.APIError as e:
         raise click.ClickException(f"API error: {e}")
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"Network error: {e}")
+    except KeyboardInterrupt:
+        console.print("\n[dim]interrupted[/dim]")
+        return
 
     console.print()  # trailing newline
 
@@ -191,18 +216,29 @@ def run_chat_loop(model_id: str | None, system_override: str | None) -> None:
 class _CLI(click.Group):
     """Group that falls back to single-shot mode when the first arg isn't a known subcommand."""
 
+    def _value_taking_opts(self) -> set[str]:
+        # Introspect own options so this stays in sync if new ones are added.
+        opts: set[str] = set()
+        for p in self.params:
+            if isinstance(p, click.Option) and not p.is_flag and not p.count:
+                opts.update(p.opts)
+                opts.update(p.secondary_opts)
+        return opts
+
     def parse_args(self, ctx, args):
-        # Split into flag args and positional args.
-        # If the first positional is not a known subcommand, treat all positionals
-        # as the prompt and only let Click parse the flags.
+        # Split into flag tokens and positional tokens. If the first positional
+        # isn't a known subcommand, treat all positionals as the prompt and only
+        # let Click parse the flags.
+        value_opts = self._value_taking_opts()
         flags, positionals = [], []
         i = 0
         while i < len(args):
             a = args[i]
             if a.startswith("-"):
-                # Consume option + its value if applicable
                 flags.append(a)
-                if a in ("-f", "--file", "-m", "--model", "-s", "--system") and i + 1 < len(args):
+                # --opt=value is a single token already; only consume the next
+                # token when the option is bare and takes a value.
+                if "=" not in a and a in value_opts and i + 1 < len(args):
                     i += 1
                     flags.append(args[i])
             else:
@@ -277,10 +313,12 @@ def keys_get(service):
     """Show a stored API key (masked)."""
     if service != "openrouter":
         raise click.UsageError(f"Unknown service '{service}'.")
-    key = get_api_key()
-    if key:
-        masked = key[:8] + "..." + key[-4:]
-        click.echo(masked)
+    env_key = os.environ.get("OPENROUTER_API_KEY")
+    stored_key = load_config().get("openrouter_api_key")
+    if env_key:
+        click.echo(f"{mask_key(env_key)} (from $OPENROUTER_API_KEY)")
+    elif stored_key:
+        click.echo(mask_key(stored_key))
     else:
         click.echo("No key set. Run: tinycode keys set openrouter sk-or-...")
 
